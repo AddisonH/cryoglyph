@@ -95,6 +95,7 @@ fn run_bench(ctx: &mut Criterion) {
                             right: 0,
                             bottom: 1000,
                         },
+                        effects: &[],
                         default_color: Color::rgb(0, 0, 0),
                     })
                     .collect();

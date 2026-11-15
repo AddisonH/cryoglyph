@@ -189,6 +189,7 @@ impl winit::application::ApplicationHandler for Application {
                                 right: 600,
                                 bottom: 160,
                             },
+                            effects: &[],
                             default_color: Color::rgb(255, 255, 255),
                         }],
                         swash_cache,

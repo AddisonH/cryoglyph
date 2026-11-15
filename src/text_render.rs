@@ -1,7 +1,8 @@
-use crate::raster::rasterize;
+use crate::raster::{self, rasterize};
 use crate::{
-    CacheKey, ColorMode, FontSystem, GlyphDetails, GlyphToRender, GpuCacheStatus, PrepareError,
-    RenderError, SwashCache, SwashContent, TextArea, TextAtlas, Viewport,
+    Color, ColorMode, FontSystem, GlyphDetails, GlyphEffects, GlyphKey, GlyphToRender,
+    GpuCacheStatus, PrepareError, RenderError, SwashCache, SwashContent, TextArea, TextAtlas,
+    TextBounds, Viewport,
 };
 use std::{num::NonZeroU64, slice};
 use wgpu::util::StagingBelt;
@@ -18,6 +19,9 @@ pub struct TextRenderer {
     vertex_buffer_size: u64,
     pipeline: RenderPipeline,
     glyph_vertices: Vec<GlyphToRender>,
+    shadows: Vec<GlyphToRender>,
+    outlines: Vec<GlyphToRender>,
+    fills: Vec<GlyphToRender>,
     glyphs_to_render: u32,
 }
 
@@ -45,6 +49,9 @@ impl TextRenderer {
             vertex_buffer_size,
             pipeline,
             glyph_vertices: Vec::new(),
+            shadows: Vec::new(),
+            outlines: Vec::new(),
+            fills: Vec::new(),
             glyphs_to_render: 0,
         }
     }
@@ -68,17 +75,27 @@ impl TextRenderer {
         let resolution = viewport.resolution();
 
         for text_area in text_areas {
-            let bounds_min_x = text_area.bounds.left.max(0);
-            let bounds_min_y = text_area.bounds.top.max(0);
-            let bounds_max_x = text_area.bounds.right.min(resolution.width as i32);
-            let bounds_max_y = text_area.bounds.bottom.min(resolution.height as i32);
+            let bounds = TextBounds {
+                left: text_area.bounds.left.max(0),
+                top: text_area.bounds.top.max(0),
+                right: text_area.bounds.right.min(resolution.width as i32),
+                bottom: text_area.bounds.bottom.min(resolution.height as i32),
+            };
+
+            // Effects reach past their glyphs, so a run just outside the bounds may still show.
+            let reach = text_area
+                .effects
+                .iter()
+                .map(GlyphEffects::reach)
+                .max()
+                .unwrap_or(0);
 
             let is_run_visible = |run: &cosmic_text::LayoutRun| {
                 let start_y_physical = (text_area.top + (run.line_top * text_area.scale)) as i32;
                 let end_y_physical = start_y_physical + (run.line_height * text_area.scale) as i32;
 
-                start_y_physical <= text_area.bounds.bottom
-                    && text_area.bounds.top <= end_y_physical
+                start_y_physical - reach <= text_area.bounds.bottom
+                    && text_area.bounds.top <= end_y_physical + reach
             };
 
             let layout_runs = text_area
@@ -91,93 +108,70 @@ impl TextRenderer {
                     let physical_glyph =
                         glyph.physical((text_area.left, text_area.top), text_area.scale);
 
-                    let Some(details) = cached_glyph(
-                        device,
-                        queue,
-                        font_system,
-                        atlas,
-                        cache,
-                        physical_glyph.cache_key,
-                    )?
+                    let glyph_key = GlyphKey {
+                        glyph: physical_glyph.cache_key,
+                        outline: 0,
+                    };
+                    let Some(fill) =
+                        cached_glyph(device, queue, font_system, atlas, cache, glyph_key)?
                     else {
                         continue;
                     };
 
-                    let mut x = physical_glyph.x + details.left as i32;
-                    let mut y = (run.line_y * text_area.scale).round() as i32 + physical_glyph.y
-                        - details.top as i32;
-
-                    let (mut atlas_x, mut atlas_y, content_type) = match details.gpu_cache {
-                        GpuCacheStatus::InAtlas { x, y, content_type } => (x, y, content_type),
-                        GpuCacheStatus::SkipRasterization => continue,
-                    };
-
-                    let mut width = details.width as i32;
-                    let mut height = details.height as i32;
-
-                    // Starts beyond right edge or ends beyond left edge
-                    let max_x = x + width;
-                    if x > bounds_max_x || max_x < bounds_min_x {
-                        continue;
-                    }
-
-                    // Starts beyond bottom edge or ends beyond top edge
-                    let max_y = y + height;
-                    if y > bounds_max_y || max_y < bounds_min_y {
-                        continue;
-                    }
-
-                    // Clip left ege
-                    if x < bounds_min_x {
-                        let right_shift = bounds_min_x - x;
-
-                        x = bounds_min_x;
-                        width = max_x - bounds_min_x;
-                        atlas_x += right_shift as u16;
-                    }
-
-                    // Clip right edge
-                    if x + width > bounds_max_x {
-                        width = bounds_max_x - x;
-                    }
-
-                    // Clip top edge
-                    if y < bounds_min_y {
-                        let bottom_shift = bounds_min_y - y;
-
-                        y = bounds_min_y;
-                        height = max_y - bounds_min_y;
-                        atlas_y += bottom_shift as u16;
-                    }
-
-                    // Clip bottom edge
-                    if y + height > bounds_max_y {
-                        height = bounds_max_y - y;
-                    }
-
-                    let color = match glyph.color_opt {
-                        Some(some) => some,
-                        None => text_area.default_color,
-                    };
-
+                    let origin = [
+                        physical_glyph.x,
+                        (run.line_y * text_area.scale).round() as i32 + physical_glyph.y,
+                    ];
+                    let color = glyph.color_opt.unwrap_or(text_area.default_color);
                     let depth = metadata_to_depth(glyph.metadata);
+                    let color_mode = atlas.color_mode;
+                    let quad = |details: &GlyphDetails, origin: [i32; 2], color: Color| {
+                        vertex(details, origin, &bounds, color, depth, color_mode)
+                    };
 
-                    self.glyph_vertices.push(GlyphToRender {
-                        pos: [x, y],
-                        dim: [width as u16, height as u16],
-                        uv: [atlas_x, atlas_y],
-                        color: color.0,
-                        content_type_with_srgb: [
-                            content_type as u16,
-                            match atlas.color_mode {
-                                ColorMode::Accurate => TextColorConversion::ConvertToLinear,
-                                ColorMode::Web => TextColorConversion::None,
-                            } as u16,
-                        ],
-                        depth,
-                    });
+                    self.fills.extend(quad(&fill, origin, color));
+
+                    let is_mask = matches!(
+                        fill.gpu_cache,
+                        GpuCacheStatus::InAtlas {
+                            content_type: ContentType::Mask,
+                            ..
+                        }
+                    );
+                    let Some(effects) = text_area.effects.get(glyph.metadata).filter(|_| is_mask)
+                    else {
+                        continue;
+                    };
+
+                    let mut silhouette = fill;
+
+                    if let Some(outline) = effects.outline {
+                        let outline_key = GlyphKey {
+                            outline: raster::outline_key(outline.width),
+                            ..glyph_key
+                        };
+
+                        if outline_key.outline > 0
+                            && let Some(outlined) =
+                                cached_glyph(device, queue, font_system, atlas, cache, outline_key)?
+                        {
+                            self.outlines.extend(quad(&outlined, origin, outline.color));
+                            silhouette = outlined;
+                        }
+                    }
+
+                    if let Some(shadow) = effects.shadow {
+                        let [x, y] = shadow.offset;
+                        let origin = [origin[0] + x, origin[1] + y];
+                        self.shadows.extend(quad(&silhouette, origin, shadow.color));
+                    }
                 }
             }
+
+            // Within a text area, no shadow or outline may cover a neighbouring glyph.
+            self.glyph_vertices.append(&mut self.shadows);
+            self.glyph_vertices.append(&mut self.outlines);
+            self.glyph_vertices.append(&mut self.fills);
         }
 
         self.glyphs_to_render = self.glyph_vertices.len() as u32;
@@ -271,6 +265,82 @@ impl TextRenderer {
     }
 }
 
+/// The quad of a glyph image whose glyph origin is at `origin`, clipped to `bounds`.
+fn vertex(
+    details: &GlyphDetails,
+    origin: [i32; 2],
+    bounds: &TextBounds,
+    color: Color,
+    depth: f32,
+    color_mode: ColorMode,
+) -> Option<GlyphToRender> {
+    let mut x = origin[0] + details.left as i32;
+    let mut y = origin[1] - details.top as i32;
+
+    let (mut atlas_x, mut atlas_y, content_type) = match details.gpu_cache {
+        GpuCacheStatus::InAtlas { x, y, content_type } => (x, y, content_type),
+        GpuCacheStatus::SkipRasterization => return None,
+    };
+
+    let mut width = details.width as i32;
+    let mut height = details.height as i32;
+
+    // Starts beyond right edge or ends beyond left edge
+    let max_x = x + width;
+    if x > bounds.right || max_x < bounds.left {
+        return None;
+    }
+
+    // Starts beyond bottom edge or ends beyond top edge
+    let max_y = y + height;
+    if y > bounds.bottom || max_y < bounds.top {
+        return None;
+    }
+
+    // Clip left ege
+    if x < bounds.left {
+        let right_shift = bounds.left - x;
+
+        x = bounds.left;
+        width = max_x - bounds.left;
+        atlas_x += right_shift as u16;
+    }
+
+    // Clip right edge
+    if x + width > bounds.right {
+        width = bounds.right - x;
+    }
+
+    // Clip top edge
+    if y < bounds.top {
+        let bottom_shift = bounds.top - y;
+
+        y = bounds.top;
+        height = max_y - bounds.top;
+        atlas_y += bottom_shift as u16;
+    }
+
+    // Clip bottom edge
+    if y + height > bounds.bottom {
+        height = bounds.bottom - y;
+    }
+
+    Some(GlyphToRender {
+        pos: [x, y],
+        dim: [width as u16, height as u16],
+        uv: [atlas_x, atlas_y],
+        color: color.0,
+        content_type_with_srgb: [
+            content_type as u16,
+            match color_mode {
+                ColorMode::Accurate => TextColorConversion::ConvertToLinear,
+                ColorMode::Web => TextColorConversion::None,
+            } as u16,
+        ],
+        depth,
+    })
+}
+
 /// Looks up a glyph in the atlas, rasterising and uploading it first if it is not there.
 fn cached_glyph(
     device: &Device,
@@ -278,20 +348,20 @@ fn cached_glyph(
     font_system: &mut FontSystem,
     atlas: &mut TextAtlas,
     cache: &mut SwashCache,
-    cache_key: CacheKey,
+    key: GlyphKey,
 ) -> Result<Option<GlyphDetails>, PrepareError> {
     let mask_generation = atlas.mask_atlas.generation;
     let color_generation = atlas.color_atlas.generation;
 
-    if let Some(details) = atlas.mask_atlas.glyph_cache.get_mut(&cache_key) {
+    if let Some(details) = atlas.mask_atlas.glyph_cache.get_mut(&key) {
         details.last_used = mask_generation;
         return Ok(Some(*details));
     }
-    if let Some(details) = atlas.color_atlas.glyph_cache.get_mut(&cache_key) {
+    if let Some(details) = atlas.color_atlas.glyph_cache.get_mut(&key) {
         details.last_used = color_generation;
         return Ok(Some(*details));
     }
-    let Some(image) = rasterize(font_system, cache, cache_key) else {
+    let Some(image) = rasterize(font_system, cache, key) else {
         return Ok(None);
     };
 
@@ -374,7 +444,7 @@ fn cached_glyph(
         left: image.placement.left as i16,
         last_used: inner.generation,
     };
-    inner.glyph_cache.put(cache_key, details);
+    inner.glyph_cache.put(key, details);
     Ok(Some(details))
 }
 

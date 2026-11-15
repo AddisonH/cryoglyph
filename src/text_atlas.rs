@@ -1,6 +1,6 @@
 use crate::raster::rasterize;
 use crate::{
-    Cache, CacheKey, FontSystem, GlyphDetails, GpuCacheStatus, SwashCache, text_render::ContentType,
+    Cache, FontSystem, GlyphDetails, GlyphKey, GpuCacheStatus, SwashCache, text_render::ContentType,
 };
 use etagere::{Allocation, BucketedAtlasAllocator, size2};
 use lru::LruCache;
@@ -22,7 +22,7 @@ pub(crate) struct InnerAtlas {
     pub texture_view: TextureView,
     pub packer: BucketedAtlasAllocator,
     pub size: u32,
-    pub glyph_cache: LruCache<CacheKey, GlyphDetails, Hasher>,
+    pub glyph_cache: LruCache<GlyphKey, GlyphDetails, Hasher>,
     /// Monotonic frame counter, bumped by `trim`. A glyph whose `last_used` equals this value has
     /// been touched since the last `trim` and is considered in use for the current frame.
     pub generation: usize,
@@ -144,13 +144,13 @@ impl InnerAtlas {
         });
 
         // Re-upload glyphs
-        for (&cache_key, glyph) in &self.glyph_cache {
+        for (&key, glyph) in &self.glyph_cache {
             let (x, y) = match glyph.gpu_cache {
                 GpuCacheStatus::InAtlas { x, y, .. } => (x, y),
                 GpuCacheStatus::SkipRasterization => continue,
             };
 
-            let image = rasterize(font_system, cache, cache_key).unwrap();
+            let image = rasterize(font_system, cache, key).unwrap();
 
             let width = image.placement.width as usize;
             let height = image.placement.height as usize;

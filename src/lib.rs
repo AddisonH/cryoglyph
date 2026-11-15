@@ -31,6 +31,59 @@ pub use cosmic_text::{
 
 use etagere::AllocId;
 
+/// Identifies a glyph image in the atlas.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct GlyphKey {
+    pub(crate) glyph: CacheKey,
+    /// The outline width in quarters of a physical pixel, or 0 for the plain glyph.
+    pub(crate) outline: u16,
+}
+
+/// Effects drawn beneath glyphs, in physical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GlyphEffects {
+    /// A border around each glyph.
+    pub outline: Option<Outline>,
+    /// A copy of each glyph, outline included, drawn at an offset.
+    pub shadow: Option<Shadow>,
+}
+
+impl GlyphEffects {
+    /// How far the effects reach past a glyph, in whole pixels.
+    pub(crate) fn reach(&self) -> i32 {
+        let outline = self
+            .outline
+            .map_or(0.0, |o| o.width.clamp(0.0, Outline::MAX_WIDTH));
+        let shadow = self
+            .shadow
+            .map_or(0, |s| s.offset[0].abs().max(s.offset[1].abs()));
+        outline.ceil() as i32 + shadow
+    }
+}
+
+/// A border drawn around glyphs. Colour and bitmap glyphs, such as emoji, have none.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Outline {
+    /// The colour of the border.
+    pub color: Color,
+    /// The width of the border, up to [`Outline::MAX_WIDTH`].
+    pub width: f32,
+}
+
+impl Outline {
+    /// The widest outline drawn; wider ones are narrowed to it.
+    pub const MAX_WIDTH: f32 = 8.0;
+}
+
+/// A hard shadow: a copy of glyphs, in one colour, drawn at an offset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shadow {
+    /// The colour of the shadow.
+    pub color: Color,
+    /// The offset of the shadow in whole pixels.
+    pub offset: [i32; 2],
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum GpuCacheStatus {
     InAtlas {
@@ -121,6 +174,10 @@ pub struct TextArea<'a> {
     /// The visible bounds of the text area. This is used to clip the text and doesn't have to
     /// match the `left` and `top` values.
     pub bounds: TextBounds,
+    /// The effects of the glyphs, indexed by each glyph's metadata; glyphs without an entry have
+    /// none. Within the text area, all shadows are drawn first, then all outlines, then the
+    /// glyphs, all at the glyph's depth.
+    pub effects: &'a [GlyphEffects],
     // The default color of the text area.
     pub default_color: Color,
 }
