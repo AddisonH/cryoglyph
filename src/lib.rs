@@ -6,6 +6,7 @@
 
 mod cache;
 mod error;
+mod raster;
 mod text_atlas;
 mod text_render;
 mod viewport;
@@ -30,6 +31,7 @@ pub use cosmic_text::{
 
 use etagere::AllocId;
 
+#[derive(Clone, Copy)]
 pub(crate) enum GpuCacheStatus {
     InAtlas {
         x: u16,
@@ -39,6 +41,7 @@ pub(crate) enum GpuCacheStatus {
     SkipRasterization,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct GlyphDetails {
     width: u16,
     height: u16,

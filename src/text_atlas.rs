@@ -1,3 +1,4 @@
+use crate::raster::rasterize;
 use crate::{
     Cache, CacheKey, FontSystem, GlyphDetails, GpuCacheStatus, SwashCache, text_render::ContentType,
 };
@@ -149,7 +150,7 @@ impl InnerAtlas {
                 GpuCacheStatus::SkipRasterization => continue,
             };
 
-            let image = cache.get_image_uncached(font_system, cache_key).unwrap();
+            let image = rasterize(font_system, cache, cache_key).unwrap();
 
             let width = image.placement.width as usize;
             let height = image.placement.height as usize;

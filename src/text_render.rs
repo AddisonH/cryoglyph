@@ -1,6 +1,7 @@
+use crate::raster::rasterize;
 use crate::{
-    ColorMode, FontSystem, GlyphDetails, GlyphToRender, GpuCacheStatus, PrepareError, RenderError,
-    SwashCache, SwashContent, TextArea, TextAtlas, Viewport,
+    CacheKey, ColorMode, FontSystem, GlyphDetails, GlyphToRender, GpuCacheStatus, PrepareError,
+    RenderError, SwashCache, SwashContent, TextArea, TextAtlas, Viewport,
 };
 use std::{num::NonZeroU64, slice};
 use wgpu::util::StagingBelt;
@@ -90,113 +91,16 @@ impl TextRenderer {
                     let physical_glyph =
                         glyph.physical((text_area.left, text_area.top), text_area.scale);
 
-                    let cache_key = physical_glyph.cache_key;
-
-                    let mask_generation = atlas.mask_atlas.generation;
-                    let color_generation = atlas.color_atlas.generation;
-
-                    let details = if let Some(details) =
-                        atlas.mask_atlas.glyph_cache.get_mut(&cache_key)
-                    {
-                        details.last_used = mask_generation;
-                        details
-                    } else if let Some(details) = atlas.color_atlas.glyph_cache.get_mut(&cache_key)
-                    {
-                        details.last_used = color_generation;
-                        details
-                    } else {
-                        let Some(image) =
-                            cache.get_image_uncached(font_system, physical_glyph.cache_key)
-                        else {
-                            continue;
-                        };
-
-                        let content_type = match image.content {
-                            SwashContent::Color => ContentType::Color,
-                            SwashContent::Mask => ContentType::Mask,
-                            SwashContent::SubpixelMask => {
-                                // Not implemented yet, but don't panic if this happens.
-                                ContentType::Mask
-                            }
-                        };
-
-                        let width = image.placement.width as usize;
-                        let height = image.placement.height as usize;
-
-                        let should_rasterize = width > 0 && height > 0;
-
-                        let (gpu_cache, atlas_id, inner) = if should_rasterize {
-                            let mut inner = atlas.inner_for_content_mut(content_type);
-
-                            // Find a position in the packer
-                            let allocation = loop {
-                                match inner.try_allocate(width, height) {
-                                    Some(a) => break a,
-                                    None => {
-                                        if !atlas.grow(
-                                            device,
-                                            queue,
-                                            font_system,
-                                            cache,
-                                            content_type,
-                                        ) {
-                                            return Err(PrepareError::AtlasFull);
-                                        }
-
-                                        inner = atlas.inner_for_content_mut(content_type);
-                                    }
-                                }
-                            };
-                            let atlas_min = allocation.rectangle.min;
-
-                            queue.write_texture(
-                                TexelCopyTextureInfo {
-                                    texture: &inner.texture,
-                                    mip_level: 0,
-                                    origin: Origin3d {
-                                        x: atlas_min.x as u32,
-                                        y: atlas_min.y as u32,
-                                        z: 0,
-                                    },
-                                    aspect: TextureAspect::All,
-                                },
-                                &image.data,
-                                TexelCopyBufferLayout {
-                                    offset: 0,
-                                    bytes_per_row: Some(width as u32 * inner.num_channels() as u32),
-                                    rows_per_image: None,
-                                },
-                                Extent3d {
-                                    width: width as u32,
-                                    height: height as u32,
-                                    depth_or_array_layers: 1,
-                                },
-                            );
-
-                            (
-                                GpuCacheStatus::InAtlas {
-                                    x: atlas_min.x as u16,
-                                    y: atlas_min.y as u16,
-                                    content_type,
-                                },
-                                Some(allocation.id),
-                                inner,
-                            )
-                        } else {
-                            let inner = &mut atlas.color_atlas;
-                            (GpuCacheStatus::SkipRasterization, None, inner)
-                        };
-
-                        // Insert the glyph into the cache and return the details reference
-                        inner.glyph_cache.get_or_insert(cache_key, || GlyphDetails {
-                            width: image.placement.width as u16,
-                            height: image.placement.height as u16,
-                            gpu_cache,
-                            atlas_id,
-                            top: image.placement.top as i16,
-                            left: image.placement.left as i16,
-                            last_used: inner.generation,
-                        })
+                    let Some(details) = cached_glyph(
+                        device,
+                        queue,
+                        font_system,
+                        atlas,
+                        cache,
+                        physical_glyph.cache_key,
+                    )?
+                    else {
+                        continue;
                     };
 
                     let mut x = physical_glyph.x + details.left as i32;
@@ -365,6 +269,113 @@ impl TextRenderer {
 
         Ok(())
     }
+}
+
+/// Looks up a glyph in the atlas, rasterising and uploading it first if it is not there.
+fn cached_glyph(
+    device: &Device,
+    queue: &Queue,
+    font_system: &mut FontSystem,
+    atlas: &mut TextAtlas,
+    cache: &mut SwashCache,
+    cache_key: CacheKey,
+) -> Result<Option<GlyphDetails>, PrepareError> {
+    let mask_generation = atlas.mask_atlas.generation;
+    let color_generation = atlas.color_atlas.generation;
+
+    if let Some(details) = atlas.mask_atlas.glyph_cache.get_mut(&cache_key) {
+        details.last_used = mask_generation;
+        return Ok(Some(*details));
+    }
+    if let Some(details) = atlas.color_atlas.glyph_cache.get_mut(&cache_key) {
+        details.last_used = color_generation;
+        return Ok(Some(*details));
+    }
+    let Some(image) = rasterize(font_system, cache, cache_key) else {
+        return Ok(None);
+    };
+
+    let content_type = match image.content {
+        SwashContent::Color => ContentType::Color,
+        SwashContent::Mask => ContentType::Mask,
+        SwashContent::SubpixelMask => {
+            // Not implemented yet, but don't panic if this happens.
+            ContentType::Mask
+        }
+    };
+
+    let width = image.placement.width as usize;
+    let height = image.placement.height as usize;
+
+    let should_rasterize = width > 0 && height > 0;
+
+    let (gpu_cache, atlas_id, inner) = if should_rasterize {
+        let mut inner = atlas.inner_for_content_mut(content_type);
+
+        // Find a position in the packer
+        let allocation = loop {
+            match inner.try_allocate(width, height) {
+                Some(a) => break a,
+                None => {
+                    if !atlas.grow(device, queue, font_system, cache, content_type) {
+                        return Err(PrepareError::AtlasFull);
+                    }
+
+                    inner = atlas.inner_for_content_mut(content_type);
+                }
+            }
+        };
+        let atlas_min = allocation.rectangle.min;
+
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &inner.texture,
+                mip_level: 0,
+                origin: Origin3d {
+                    x: atlas_min.x as u32,
+                    y: atlas_min.y as u32,
+                    z: 0,
+                },
+                aspect: TextureAspect::All,
+            },
+            &image.data,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width as u32 * inner.num_channels() as u32),
+                rows_per_image: None,
+            },
+            Extent3d {
+                width: width as u32,
+                height: height as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        (
+            GpuCacheStatus::InAtlas {
+                x: atlas_min.x as u16,
+                y: atlas_min.y as u16,
+                content_type,
+            },
+            Some(allocation.id),
+            inner,
+        )
+    } else {
+        let inner = &mut atlas.color_atlas;
+        (GpuCacheStatus::SkipRasterization, None, inner)
+    };
+
+    let details = GlyphDetails {
+        width: image.placement.width as u16,
+        height: image.placement.height as u16,
+        gpu_cache,
+        atlas_id,
+        top: image.placement.top as i16,
+        left: image.placement.left as i16,
+        last_used: inner.generation,
+    };
+    inner.glyph_cache.put(cache_key, details);
+    Ok(Some(details))
 }
 
 #[repr(u16)]
